@@ -23,6 +23,9 @@ accounts.json.bak
 log*.txt
 qwenproxy-api-*.log.txt
 
+# Local account browser profiles and persisted session state
+qwen_profiles/
+
 # Network captures
 network/
 

@@ -545,6 +545,11 @@ const HEADER_REFRESH_THRESHOLD = 0.8; // Background refresh at 80% of TTL
 const COOKIE_CACHE_TTL = 60 * 1000; // 1 minute (prevents returning stale expiring token after refresh)
 const cookieCaches = new Map<string, { cookie: string; timestamp: number }>();
 const lastAccountActivity = new Map<string, number>();
+// Logging guard for repeated context warmups. Context recreation can be valid
+// after eviction/crash, but one restore per request floods logs and hides real
+// authentication failures.
+const lastHeaderRestoreLog = new Map<string, number>();
+const HEADER_RESTORE_LOG_TTL = 5 * 60 * 1000;
 const lastKeepAliveNavigation = new Map<string, number>();
 const lastProactiveTokenRefresh = new Map<string, number>();
 const profileResetQueue = new Map<string, Promise<void>>();
@@ -1825,9 +1830,14 @@ export async function initPlaywrightForAccount(
               cache.lastRefresh = persisted.capturedAt;
               markAccountHeadersReady(account.id);
               restoredFromDb = true;
-              console.log(
-                `⚡ [Playwright] Restored anti-bot headers from database for ${maskEmail(account.email)} (age: ${Math.round((Date.now() - persisted.capturedAt) / 60000)}m, bypassed UI typing)`,
-              );
+              const now = Date.now();
+              const lastRestoreLog = lastHeaderRestoreLog.get(account.id) ?? 0;
+              if (now - lastRestoreLog >= HEADER_RESTORE_LOG_TTL) {
+                lastHeaderRestoreLog.set(account.id, now);
+                console.log(
+                  `⚡ [Playwright] Restored anti-bot headers from database for ${maskEmail(account.email)} (age: ${Math.round((now - persisted.capturedAt) / 60000)}m, bypassed UI typing)`,
+                );
+              }
             }
           }
         } catch {}
@@ -5013,17 +5023,24 @@ export async function evictIdlePlaywrightContextsToLimit(
   const max = targetLimit !== undefined ? Math.max(0, targetLimit) : configuredMax;
   if (accountPages.size <= max) return 0;
 
-  const candidates = priorityOrderForEviction(
-    Array.from(accountPages.keys()).filter((accountId) => {
-      if (isAccountServingStream(accountId)) return false;
-      // A request may hold a stream lease while still acquiring the page mutex
-      // (pre-stream setup). Closing that context would fail the request even
-      // though the mutex still looks idle, so treat any lease as "in use".
-      if (hasActiveAccountLease(accountId)) return false;
-      const mutex = accountMutexes.get(accountId);
-      return mutex?.isIdle();
-    }),
-  ).map((accountId) => ({
+  const eligibleAccounts = Array.from(accountPages.keys()).filter((accountId) => {
+    if (isAccountServingStream(accountId)) return false;
+    // A request may hold a stream lease while still acquiring the page mutex
+    // (pre-stream setup). Closing that context would fail the request even
+    // though the mutex still looks idle, so treat any lease as "in use".
+    if (hasActiveAccountLease(accountId)) return false;
+    const mutex = accountMutexes.get(accountId);
+    return mutex?.isIdle();
+  });
+  // Keep recently used healthy contexts warm. Context eviction caused the next
+  // request to reopen the browser and restore identical SQLite headers again.
+  // Cooldown contexts remain evictable immediately; they cannot serve traffic.
+  const evictionCandidates = eligibleAccounts.filter((accountId) =>
+    Boolean(getAccountCooldownInfo(accountId)) ||
+    !isAccountRecentlyActive(accountId, 5 * 60_000),
+  );
+  if (evictionCandidates.length === 0) return 0;
+  const candidates = priorityOrderForEviction(evictionCandidates).map((accountId) => ({
     accountId,
     mutex: accountMutexes.get(accountId),
     lastActivity: lastAccountActivity.get(accountId) ?? 0,
@@ -5151,6 +5168,8 @@ function cleanupPlaywrightAccountState(accountId: string): void {
   headerCaches.delete(accountId);
   cookieCaches.delete(accountId);
   lastAccountActivity.delete(accountId);
+  // Keep restore-log throttle across context eviction/reinitialization. Clearing
+  // it here turns every browser reopen into a fresh burst of identical logs.
   lastKeepAliveNavigation.delete(accountId);
   lastProactiveTokenRefresh.delete(accountId);
   refreshTokenFailureBackoff.delete(accountId);

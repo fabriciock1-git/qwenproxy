@@ -21,6 +21,7 @@ import { anthropicApp } from "../routes/anthropic/index.ts";
 import { sendOpenAIError } from "./error-helpers.js";
 import { AuthError, NotFoundError } from "../core/errors.js";
 import type { QwenAccount } from "../core/accounts.js";
+import { getDatabase } from "../core/database.ts";
 import { isAuthMockEnabled } from "../services/auth-playwright.js";
 import {
   assertBindAllowed,
@@ -222,8 +223,16 @@ function extractProvidedApiKeys(c: Context): string[] {
 }
 
 function verifyApiKey(c: Context): Response | null {
+  const hostHeader = (c.req.header("host") || "").split(":")[0];
+  const forwardedFor = (c.req.header("x-forwarded-for") || "").split(",")[0].trim();
+  const isLoopback = isLoopbackHost(hostHeader) || (forwardedFor ? isLoopbackHost(forwardedFor) : false);
+
+  if (isLoopback && process.env.ALLOW_LOOPBACK_ANONYMOUS !== "false") {
+    return null;
+  }
+
   const apiKey = (process.env.API_KEY || config.apiKey || "").trim();
-  if (isLoopbackHost(config.server.host) && isPlaceholderApiKey(apiKey)) {
+  if (isPlaceholderApiKey(apiKey)) {
     return null;
   }
   if (!apiKey) return null;
@@ -254,9 +263,19 @@ function verifyApiKey(c: Context): Response | null {
       ),
     );
   }
+
   if (candidates.some((token) => constantTimeStringEqual(token, apiKey))) {
     return null;
   }
+
+  try {
+    const db = getDatabase();
+    for (const token of candidates) {
+      const user = db.prepare("SELECT id FROM users WHERE api_key = ?").get(token);
+      if (user) return null;
+    }
+  } catch {}
+
   if (isAnthropic) {
     c.header("anthropic-version", c.req.header("anthropic-version") || "2023-06-01");
     return c.json(

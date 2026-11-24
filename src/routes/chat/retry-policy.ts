@@ -296,7 +296,10 @@ export function isAntiBotError(err: unknown): boolean {
     message.includes("security verification") ||
     message.includes("verify you are human") ||
     message.includes("human verification") ||
-    message.includes("denyfromx5")
+    message.includes("denyfromx5") ||
+    message.includes("unexpected token '<'") ||
+    message.includes("<!doctype") ||
+    message.includes("<html")
   );
 }
 
@@ -632,10 +635,17 @@ export function classifyRetryAction(
     }
 
     if (isAntiBotError(err)) {
-      // WAF/captcha is only identified here. Retry the same request on the
-      // same account immediately; recovery, cooldown and account rotation are
-      // intentionally left out so the failure path stays observable.
-      return makeRetryAction("anti_bot");
+      // WAF state belongs to account/fingerprint. Retrying same account keeps
+      // sending the same blocked fingerprint and stalls the whole request.
+      // Quarantine it, then rotate to next untried account immediately.
+      return makeRetryAction("anti_bot", {
+        switchAccount: true,
+        forceNewChat: true,
+        retryWithFullPrompt: true,
+        retryAfterMs: Math.min(baseDelayMs, 1_000),
+        accountCooldownMs: config.captcha.accountCooldownMs,
+        accountCooldownReason: "WafChallenge",
+      });
     }
 
     if (isQuotaLikeError(err)) {

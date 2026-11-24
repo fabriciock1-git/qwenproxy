@@ -1614,13 +1614,10 @@ export async function processStreamingResponse(
           policy.switchAccount && !retryInvalidInputOnSameAccount;
 
         if (policy.reason === "anti_bot") {
-          if (antiBotSameAccountRetries === 0) {
-            antiBotSameAccountRetries++;
-            switchAccount = false;
-          } else {
-            switchAccount = true;
-            markAccountRateLimited(currentAccountId, 60_000, "AntiBotWafChallenge");
-          }
+          // WAF challenge already carries account quarantine + rotation policy.
+          // Never retry blocked fingerprint on same account.
+          switchAccount = true;
+          antiBotSameAccountRetries++;
         }
 
         if (

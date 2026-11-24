@@ -18,7 +18,10 @@ function isWafChallenge(value: string): boolean {
     normalized.includes("rgv587_error") ||
     normalized.includes("denyfromx5") ||
     normalized.includes("captcha") ||
-    normalized.includes("security verification")
+    normalized.includes("security verification") ||
+    normalized.includes("<!doctype") ||
+    normalized.includes("<html") ||
+    normalized.includes("unexpected token '<'")
   );
 }
 

@@ -2608,6 +2608,7 @@ export async function fetchQwenModels(
         return entry.models;
       }
     }
+    throw new Error(`Account ${accountId} is not initialized for model fetch`);
   }
 
   // Use an isolated page only when the main page is actively serving a stream.

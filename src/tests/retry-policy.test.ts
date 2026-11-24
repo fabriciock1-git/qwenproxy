@@ -231,17 +231,18 @@ test("classifyRetryAction: real quota exhaustion prefers account switch", () => 
   assert.equal(action.reason, "quota_or_rate_limit");
 });
 
-test("classifyRetryAction: WAF challenges retry the same account immediately", () => {
+test("classifyRetryAction: WAF challenges quarantine and rotate accounts", () => {
   const err = Object.assign(
     new Error("Qwen returned an anti-bot challenge instead of an SSE response."),
     { upstreamCode: "waf_challenge" },
   );
   const action = classifyRetryAction(err);
   assert.equal(action.retryable, true);
-  assert.equal(action.switchAccount, false);
-  assert.equal(action.retryAfterMs, 0);
-  assert.equal(action.accountCooldownMs, undefined);
-  assert.equal(action.accountCooldownReason, undefined);
+  assert.equal(action.switchAccount, true);
+  assert.equal(action.forceNewChat, true);
+  assert.equal(action.retryWithFullPrompt, true);
+  assert.equal(action.accountCooldownMs, config.captcha.accountCooldownMs);
+  assert.equal(action.accountCooldownReason, "WafChallenge");
   assert.equal(action.reason, "anti_bot");
 });
 

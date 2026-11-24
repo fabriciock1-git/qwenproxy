@@ -1025,19 +1025,26 @@ async function tryCreateStreamWithRetry(
 				};
 			}
 
-			// Always sync the model catalog so the truncation and prompt-limit
-			// checks use the real context window published by Qwen, not the
-			// conservative registry fallback. The call is cached per account.
-			try {
-				await fetchQwenModels(currentAccountId);
-			} catch (metadataError) {
-				logger.warn("[chat] model metadata sync unavailable; using registry fallback", {
-					model: params.contextModelId ?? params.model,
-					error:
-						metadataError instanceof Error
-							? metadataError.message
-							: String(metadataError),
-				});
+			// Sync model catalog only when account context already exists. A cold
+			// account cannot fetch metadata without opening Playwright first; doing
+			// that here serialized the request behind personalization and caused
+			// zero-chunk hangs. Registry fallback already covers cold accounts.
+			if (
+				currentAccountId === "global" ||
+				isAuthMockEnabled() ||
+				isPlaywrightInitialized(currentAccountId)
+			) {
+				try {
+					await fetchQwenModels(currentAccountId);
+				} catch (metadataError) {
+					logger.warn("[chat] model metadata sync unavailable; using registry fallback", {
+						model: params.contextModelId ?? params.model,
+						error:
+							metadataError instanceof Error
+									? metadataError.message
+									: String(metadataError),
+					});
+				}
 			}
 
 			// Truncate after the real context window is known so long conversations

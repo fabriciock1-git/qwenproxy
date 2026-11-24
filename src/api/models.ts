@@ -208,7 +208,7 @@ function findModel(
   return models.find((entry) => entry.id === modelId);
 }
 
-app.get("/v1/models", async (c) => {
+const handleModels = async (c: any) => {
   try {
     const { models: allModels, accountId } = await loadModelsWithVariants();
     const anthropic = wantsAnthropicModelsFormat(c.req.header("anthropic-version"));
@@ -237,9 +237,9 @@ app.get("/v1/models", async (c) => {
     console.error("❌ [Models] Error fetching models:", error);
     return sendOpenAIError(c, error);
   }
-});
+};
 
-app.get("/v1/models/:model", async (c) => {
+const handleModelDetail = async (c: any) => {
   try {
     const modelId = c.req.param("model");
     const { models: allModels, accountId } = await loadModelsWithVariants();
@@ -271,7 +271,12 @@ app.get("/v1/models/:model", async (c) => {
     console.error("❌ [Models] Error fetching model:", error);
     return sendOpenAIError(c, error);
   }
-});
+};
+
+app.get("/v1/models", handleModels);
+app.get("/models", handleModels);
+app.get("/v1/models/:model", handleModelDetail);
+app.get("/models/:model", handleModelDetail);
 
 
 export { app };

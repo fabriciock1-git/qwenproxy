@@ -37,6 +37,12 @@ export function localApiAuthHeaders(): Record<string, string> {
 export function assertBindAllowed(host: string, apiKey: string): void {
   if (isLoopbackHost(host)) return;
   if (!isPlaceholderApiKey(apiKey)) return;
+  if (process.env.ALLOW_ANONYMOUS_BIND === "true" || process.env.NODE_ENV === "production") {
+    console.warn(
+      `⚠️  [Server] HOST=${host} is reachable beyond loopback without an API_KEY. Running in LAN/open network mode.`,
+    );
+    return;
+  }
   throw new Error(
     `❌ [Server] HOST=${host} is reachable beyond loopback and requires a strong API_KEY.` +
       `\n   Bind 127.0.0.1 for local-only use, or set API_KEY before exposing ${host}.`,
