@@ -3461,17 +3461,14 @@ async function createQwenStreamInternal(
       });
       if (!solved) return false;
 
-      // The challenge may have rotated bx-* values or session cookies. Refresh
-      // them only after the visible challenge was solved, then replay the same
-      // payload on the same account.
-      const refreshed = await getQwenHeaders(true, accountId);
-      activeHeaders = refreshed.headers;
-      if (config.captcha.retryDelayMs > 0) {
-        await sleep(config.captcha.retryDelayMs);
-      }
-      ensureNotAborted();
-      response = await fetchCompletion(activeHeaders);
-      return true;
+      // Solving response-body CAPTCHA does not prove authenticated session.
+      // Do not replay completion with stale headers. Let caller classify WAF,
+      // rotate account, and re-enter official auth FSM on same browser context.
+      logger.warn("[Qwen] CAPTCHA solved; refusing same-session completion replay", {
+        accountId,
+        label,
+      });
+      return false;
     };
 
     let captchaMetadataRetryAttempted = false;
@@ -3503,23 +3500,18 @@ async function createQwenStreamInternal(
       ) {
         captchaMetadataRetryAttempted = true;
         logger.warn(
-          "[Qwen] Completion headers timed out after captcha recovery; retrying with fresh headers",
+          "[Qwen] Completion headers timed out after CAPTCHA recovery; refusing same-session replay",
           {
             accountId,
             chatId: chatSessionId ?? "new",
           },
         );
-        const refreshed = await getQwenHeaders(true, accountId);
-        activeHeaders = refreshed.headers;
-        if (config.captcha.retryDelayMs > 0) {
-          await sleep(config.captcha.retryDelayMs);
-        }
-        try {
-          ensureNotAborted();
-          response = await fetchCompletion(activeHeaders);
-        } catch (retryError) {
-          throwFetchCompletionError(retryError);
-        }
+        const wafError = new RetryableQwenStreamError(
+          "CAPTCHA solved but authenticated session was not re-established",
+          0,
+        );
+        wafError.upstreamCode = "waf_challenge";
+        throw wafError;
       } else {
         throwFetchCompletionError(error);
       }
