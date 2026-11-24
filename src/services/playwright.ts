@@ -608,18 +608,14 @@ const CHAT_INPUT_ACTION_TIMEOUT_MS = 10_000;
  */
 async function clearVisibleChallenge(page: Page): Promise<void> {
   if (page.isClosed()) return;
-  // 1. Solve a slider/jigsaw challenge if present (Baxia NC or Aliyun WAF)
-  if (config.captcha.enabled) {
-    await solveVisibleCaptcha(page, {
-      waitForMs: 0,
-      maxAttempts: config.captcha.maxAttempts,
-      retryDelayMs: config.captcha.retryDelayMs,
-      settleMs: config.captcha.settleMs,
-      sliderTimeoutMs: config.captcha.sliderTimeoutMs,
-    }).catch(() => false);
-  }
 
-  // 2. Dismiss any overlay modals (Welcome to Qwen, Terms/Consent, Whats New, etc.)
+  // Do not solve authentication challenges programmatically. The official Qwen
+  // flow requires human verification; leave the page open for the operator.
+  // Completion-time challenge recovery uses a separate, explicit coordinator.
+
+  // Dismiss any non-security overlay modals (Welcome to Qwen, Terms/Consent,
+  // Whats New, etc.) that can block the auth form.
+
   // that can block the chat textarea or send button
   try {
     const modalCloseSelectors = [
@@ -648,6 +644,38 @@ async function clearVisibleChallenge(page: Page): Promise<void> {
       }
     }
   } catch {}
+}
+
+async function waitForHumanAuthChallengeToClear(page: Page): Promise<void> {
+  if (page.isClosed()) return;
+  const deadline = Date.now() + 10 * 60_000;
+  let announced = false;
+  while (!page.isClosed() && Date.now() < deadline) {
+    const challengeVisible = await page
+      .evaluate(() => {
+        const text = (document.body?.innerText || "").toLowerCase();
+        return (
+          text.includes("access verification") ||
+          text.includes("drag to complete") ||
+          text.includes("real person") ||
+          text.includes("verificação de acesso") ||
+          text.includes("arraste para completar")
+        );
+      })
+      .catch(() => false);
+    if (!challengeVisible) return;
+    if (!announced) {
+      announced = true;
+      console.warn(
+        "⚠️ [Playwright] Human verification required; complete Qwen challenge in the open account browser",
+      );
+    }
+    await sleep(1000);
+  }
+  if (!page.isClosed()) {
+    throw new Error("Human verification timeout during Qwen authentication");
+  }
+  throw new Error("Qwen authentication page closed during human verification");
 }
 
 function getErrorMessage(error: unknown): string {
@@ -2602,59 +2630,9 @@ async function loginToQwen(
       return false;
     }
 
-    // Try API login first
-    const apiResult = await loginViaApi(page, email, password, accountId);
-    if (apiResult.success) {
-      cookieCaches.delete(accountId);
-      await saveStorageState(page.context(), accountId);
-      try {
-        const liveCookies = await page.context().cookies();
-        const tokenCookie = liveCookies.find((c) => c.name === "token");
-        if (tokenCookie) {
-          const cookieStr = liveCookies.map((c) => `${c.name}=${c.value}`).join("; ");
-          const cache = getHeaderCache(accountId);
-          cache.headers.cookie = cookieStr;
-          cache.lastRefresh = Date.now();
-          if (hasRequiredQwenHeaders(cache.headers)) {
-            markAccountHeadersReady(accountId);
-          }
-          const { saveAuthSession } = await import("../core/database.ts");
-          const exp = parseJwtExpiry(tokenCookie.value);
-          saveAuthSession(accountId, {
-            cookie: cookieStr,
-            userAgent:
-              cache.headers["user-agent"] ||
-              getFingerprintProfile(accountId).userAgent ||
-              "",
-            bxV: cache.headers["bx-v"] || getQwenBxVersion(),
-            bxUa: cache.headers["bx-ua"] || "",
-            bxUmidtoken: cache.headers["bx-umidtoken"] || "",
-            secChUa: cache.headers["sec-ch-ua"] || undefined,
-            secChUaMobile: cache.headers["sec-ch-ua-mobile"] || undefined,
-            secChUaPlatform: cache.headers["sec-ch-ua-platform"] || undefined,
-            version: cache.headers["version"] || undefined,
-            tokenExpiresAt: exp || undefined,
-            refreshToken: apiResult.refreshToken,
-            capturedAt: Date.now(),
-          });
-        }
-      } catch {}
-      return true;
-    }
-
-    if (apiResult.permanentFailure) {
-      console.error(
-        `❌ [Playwright] Falha irrecuperável de autenticação para ${maskEmail(email)}: ${apiResult.reason}`,
-      );
-      markAccountRateLimited(
-        accountId,
-        24 * 3600 * 1000,
-        `AuthPermanentFailure: ${apiResult.reason}`,
-      );
-      return false;
-    }
-
-    // Fallback to UI login
+    // Official browser flow. Operator completes Access Verification, then
+    // switches from OTP to password login. Credentials come from account
+    // storage; never log password or tokens.
     const uiResult = await loginViaUi(page, email, password);
     if (uiResult.success) {
       cookieCaches.delete(accountId);
@@ -2737,7 +2715,7 @@ async function loginToQwen(
 
     if (attempt < maxAttempts) {
       const backoffMs = attempt * 5_000;
-      const failReason = uiResult.reason || apiResult.reason || "falha temporária";
+      const failReason = uiResult.reason || "falha temporária";
       console.warn(
         `⚠️  [Playwright] Login attempt ${attempt}/${maxAttempts} failed for ${maskEmail(email)} (${failReason}), retrying in ${backoffMs / 1000}s`,
       );
@@ -3048,17 +3026,9 @@ async function loginViaUi(
       return { success: true };
     }
 
-    // A WAF jigsaw can render before the form is usable. Clear it first so the
-    // email/password fields are not covered and the submit is not rejected.
-    if (config.captcha.enabled) {
-      await solveVisibleCaptcha(page, {
-        waitForMs: 1_500,
-        maxAttempts: config.captcha.maxAttempts,
-        retryDelayMs: config.captcha.retryDelayMs,
-        settleMs: config.captcha.settleMs,
-        sliderTimeoutMs: config.captcha.sliderTimeoutMs,
-      }).catch(() => false);
-    }
+    // Keep official security verification visible for human completion.
+    // Do not reload, click around it, or solve it in code.
+    await waitForHumanAuthChallengeToClear(page);
 
     // Wait for email input
     const emailSelector = [
@@ -3277,15 +3247,9 @@ async function loginViaUi(
     while (Date.now() < postSubmitDeadline) {
       if (page.isClosed()) break;
 
-      // If a slider/jigsaw challenge appeared after submit, solve it automatically
-      if (config.captcha.enabled) {
-        await solveVisibleCaptcha(page, {
-          waitForMs: 1500,
-          maxAttempts: config.captcha.maxAttempts,
-          retryDelayMs: config.captcha.retryDelayMs,
-          sliderTimeoutMs: config.captcha.sliderTimeoutMs,
-        }).catch(() => {});
-      }
+      // If official security verification appeared after submit, keep page open
+      // and wait for human completion. Never reload or solve it in code.
+      await waitForHumanAuthChallengeToClear(page);
 
       // Check for UI error elements in DOM (Ant Design errors, alerts, toasts)
       const errorSelector = [
