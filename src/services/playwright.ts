@@ -3026,9 +3026,16 @@ async function loginViaUi(
       return { success: true };
     }
 
-    // Keep official security verification visible for human completion.
-    // Do not reload, click around it, or solve it in code.
-    await waitForHumanAuthChallengeToClear(page);
+    // CAPTCHA remains automatic. After it clears, Qwen shows second-factor UI.
+    if (config.captcha.enabled) {
+      await solveVisibleCaptcha(page, {
+        waitForMs: 1_500,
+        maxAttempts: config.captcha.maxAttempts,
+        retryDelayMs: config.captcha.retryDelayMs,
+        settleMs: config.captcha.settleMs,
+        sliderTimeoutMs: config.captcha.sliderTimeoutMs,
+      }).catch(() => false);
+    }
 
     // Wait for email input
     const emailSelector = [
@@ -3073,12 +3080,16 @@ async function loginViaUi(
       return { success: false, reason: "Campo de e-mail não encontrado (possível captcha)" };
     }
 
-    // In Qwen Web, if the page opens on the default email OTP panel, click "Log in with a password"
-    // (supporting English, Portuguese, Spanish, Chinese) to reveal the standard email + password form.
-    await clearVisibleChallenge(page);
+    // First screen accepts email only. Submit it; Qwen then runs CAPTCHA and
+    // opens its second-auth screen. Password mode exists on that next screen.
 
     const isPasswordInputPresent = async () => {
-      return (await page.locator('input[type="password"], input[name="password"]').count().catch(() => 0)) > 0;
+      return (
+        (await page
+          .locator('input[type="password"], input[name="password"]')
+          .count()
+          .catch(() => 0)) > 0
+      );
     };
 
     const revealPasswordMode = async () => {
@@ -3137,9 +3148,8 @@ async function loginViaUi(
       await sleep(500);
     };
 
-    await revealPasswordMode();
-
-    // Fill email
+    // Fill email on first auth screen, then click Continue. This intentionally
+    // enters Qwen's email-verification step; password fallback appears there.
     try {
       await page.fill(emailSelector, email, { timeout: 8_000 });
       await sleep(300);
@@ -3150,42 +3160,43 @@ async function loginViaUi(
       throw new Error(`Campo de e-mail não encontrado na tela de autenticação`);
     }
 
-    // If password field is still not visible after typing email, trigger reveal again
-    if (!(await isPasswordInputPresent())) {
-      await revealPasswordMode();
+    const continueButton = page
+      .locator("button, [role='button']")
+      .filter({ hasText: /^(continuar|continue|next|下一步)$/i })
+      .first();
+    if (await continueButton.isVisible({ timeout: 2_000 }).catch(() => false)) {
+      await continueButton.click({ timeout: 3_000 });
+    } else {
+      await page.locator(emailSelector).first().press("Enter");
     }
 
-    // In Qwen Web, the password field is present on the same form.
-    // NEVER press Enter after filling email alone, as Qwen interprets that
-    // as a request to sign in via email verification code (passwordless OTP).
-    const passwordSelector =
-      'input[type="password"], input[name="password"]';
-    try {
-      await page.waitForSelector(passwordSelector, {
-        timeout: 10_000,
-      });
-    } catch {
-      if (!page.url().includes("/auth") && (await isPageLoggedIn(page, 3000))) {
-        return { success: true };
-      }
-      console.warn(
-        `⚠️  [Playwright] Password input not found on ${page.url()}`,
-      );
-      return {
-        success: false,
-        reason: "Campo de senha não encontrado na tela de autenticação",
-      };
+    // CAPTCHA remains automatic. Wait for it to settle before second auth.
+    if (config.captcha.enabled) {
+      await solveVisibleCaptcha(page, {
+        waitForMs: 1_000,
+        maxAttempts: config.captcha.maxAttempts,
+        retryDelayMs: config.captcha.retryDelayMs,
+        settleMs: config.captcha.settleMs,
+        sliderTimeoutMs: config.captcha.sliderTimeoutMs,
+      }).catch(() => false);
     }
 
-    // Fill password
+    await sleep(1_000);
+    await revealPasswordMode();
+
+    const passwordSelector = 'input[type="password"], input[name="password"]';
     try {
+      await page.waitForSelector(passwordSelector, { timeout: 10_000 });
       await page.fill(passwordSelector, password, { timeout: 8_000 });
       await sleep(500);
     } catch {
       if (!page.url().includes("/auth") && (await isPageLoggedIn(page, 3000))) {
         return { success: true };
       }
-      throw new Error(`Campo de senha não encontrado na tela de autenticação`);
+      return {
+        success: false,
+        reason: "Opção de login com senha ou campo de senha não encontrado após CAPTCHA",
+      };
     }
 
     // Dispatch input/change/blur events so Ant Design / React enables the submit button
@@ -3247,9 +3258,16 @@ async function loginViaUi(
     while (Date.now() < postSubmitDeadline) {
       if (page.isClosed()) break;
 
-      // If official security verification appeared after submit, keep page open
-      // and wait for human completion. Never reload or solve it in code.
-      await waitForHumanAuthChallengeToClear(page);
+      // CAPTCHA remains automatic during auth transitions.
+      if (config.captcha.enabled) {
+        await solveVisibleCaptcha(page, {
+          waitForMs: 500,
+          maxAttempts: config.captcha.maxAttempts,
+          retryDelayMs: config.captcha.retryDelayMs,
+          settleMs: config.captcha.settleMs,
+          sliderTimeoutMs: config.captcha.sliderTimeoutMs,
+        }).catch(() => false);
+      }
 
       // Check for UI error elements in DOM (Ant Design errors, alerts, toasts)
       const errorSelector = [
@@ -3278,23 +3296,8 @@ async function loginViaUi(
         }
       }
 
-      // Check if an OTP code verification screen appeared (e.g. 2FA / email verification code)
-      const codeSelector = [
-        'input[placeholder*="code" i]',
-        'input[placeholder*="código" i]',
-        'input[name*="code" i]',
-        ".qwenchat-verification-code-input",
-        ".qwenchat-verification-code-input-cell",
-        '[aria-label*="Verification code" i]',
-        '[aria-label*="código de verificação" i]',
-      ].join(", ");
-      const codeInput = page.locator(codeSelector).first();
-      if (await codeInput.isVisible().catch(() => false)) {
-        return {
-          success: false,
-          reason: "Conta requer código de verificação enviado por e-mail (2FA/OTP)",
-        };
-      }
+      // OTP screen is expected before password fallback. It must not remain
+      // after password submit; otherwise authentication is incomplete.
 
       // Check if auth cookie 'token' appeared or localStorage 'token' was populated (Qwen 0.3.26+)
       try {
