@@ -3026,16 +3026,8 @@ async function loginViaUi(
       return { success: true };
     }
 
-    // CAPTCHA remains automatic. After it clears, Qwen shows second-factor UI.
-    if (config.captcha.enabled) {
-      await solveVisibleCaptcha(page, {
-        waitForMs: 1_500,
-        maxAttempts: config.captcha.maxAttempts,
-        retryDelayMs: config.captcha.retryDelayMs,
-        settleMs: config.captcha.settleMs,
-        sliderTimeoutMs: config.captcha.sliderTimeoutMs,
-      }).catch(() => false);
-    }
+    // CAPTCHA remains automatic after credentials are submitted.
+    // Do not run solver before email/password form is submitted.
 
     // Wait for email input
     const emailSelector = [
@@ -3099,53 +3091,37 @@ async function loginViaUi(
         await sleep(1000);
       }
 
-      // If password input is already in DOM, do NOT click any switch buttons!
+      // OTP page can load asynchronously after CAPTCHA. Keep same page/context
+      // and poll for official password fallback instead of guessing timing.
       if (await isPasswordInputPresent()) return;
 
       const passwordSwitchRegex =
         /(?:log\s*in\s*with\s*(?:a\s*)?password|fazer\s*login\s*com\s*senha|entrar\s*com\s*(?:uma\s*)?senha|iniciar\s*sesi[oó]n\s*con\s*contrase[nñ]a|密码登录)/i;
       const excludedRegex = /(?:esqueci|forgot|olvid|reset|recover)/i;
-
-      // 1. Playwright locator with multilingual matching covering button, a, span, div, p
-      const switchLocator = page
-        .locator("button, a, span, div, p, [role='button']")
-        .filter({
-          hasText: passwordSwitchRegex,
-        })
-        .filter({
-          hasNotText: excludedRegex,
-        })
-        .first();
-
-      if (await switchLocator.isVisible({ timeout: 1500 }).catch(() => false)) {
-        await switchLocator.click({ timeout: 2000 }).catch(() => {});
+      const deadline = Date.now() + 20_000;
+      while (!page.isClosed() && Date.now() < deadline) {
+        const switchLocator = page
+          .locator("button, a, [role='button'], span")
+          .filter({ hasText: passwordSwitchRegex })
+          .filter({ hasNotText: excludedRegex })
+          .first();
+        if (await switchLocator.isVisible({ timeout: 500 }).catch(() => false)) {
+          await switchLocator.click({ timeout: 3_000 }).catch(() => {});
+        } else {
+          await page.evaluate(() => {
+            const re = /(?:log\s*in\s*with\s*(?:a\s*)?password|fazer\s*login\s*com\s*senha|entrar\s*com\s*(?:uma\s*)?senha|iniciar\s*sesi[oó]n\s*con\s*contrase[nñ]a|密码登录)/i;
+            const excluded = /(?:esqueci|forgot|olvid|reset|recover)/i;
+            const nodes = Array.from(document.querySelectorAll("button, a, [role='button'], span"))
+              .filter((el) => {
+                const text = ((el as HTMLElement).innerText || "").trim();
+                return text.length < 80 && re.test(text) && !excluded.test(text);
+              });
+            (nodes[0] as HTMLElement | undefined)?.click();
+          }).catch(() => {});
+        }
         await sleep(500);
+        if (await isPasswordInputPresent()) return;
       }
-
-      if (await isPasswordInputPresent()) return;
-
-      // 2. In-page evaluate fail-safe to trigger direct DOM click on the password button/link
-      await page
-        .evaluate(() => {
-          try {
-            const elements = Array.from(
-              document.querySelectorAll("button, [role='button'], a, span, div, p"),
-            );
-            for (const el of elements) {
-              const txt = ((el as HTMLElement).innerText || "").trim().toLowerCase();
-              if (
-                /(?:log\s*in\s*with\s*(?:a\s*)?password|fazer\s*login\s*com\s*senha|entrar\s*com\s*(?:uma\s*)?senha|iniciar\s*sesi[oó]n\s*con\s*contrase[nñ]a|密码登录)/i.test(txt) &&
-                !txt.includes("esqueci") && !txt.includes("forgot") && !txt.includes("olvid") && !txt.includes("reset")
-              ) {
-                (el as HTMLElement).click();
-                return true;
-              }
-            }
-          } catch {}
-          return false;
-        })
-        .catch(() => false);
-      await sleep(500);
     };
 
     // Fill email on first auth screen, then click Continue. This intentionally
@@ -3160,14 +3136,29 @@ async function loginViaUi(
       throw new Error(`Campo de e-mail não encontrado na tela de autenticação`);
     }
 
-    const continueButton = page
-      .locator("button, [role='button']")
-      .filter({ hasText: /^(continuar|continue|next|下一步)$/i })
-      .first();
-    if (await continueButton.isVisible({ timeout: 2_000 }).catch(() => false)) {
-      await continueButton.click({ timeout: 3_000 });
+    const initialPassword = page.locator('input[type="password"], input[name="password"]').first();
+    const hasInitialPassword = await initialPassword.isVisible({ timeout: 1_000 }).catch(() => false);
+    if (hasInitialPassword) {
+      await initialPassword.fill(password, { timeout: 5_000 });
+      const initialSubmit = page
+        .locator('button[type="submit"], button.qwenchat-auth-pc-submit-button, button')
+        .filter({ hasText: /^(fazer login|log in|sign in|entrar|登录)$/i })
+        .first();
+      if (await initialSubmit.isVisible({ timeout: 2_000 }).catch(() => false)) {
+        await initialSubmit.click({ timeout: 3_000 });
+      } else {
+        await initialPassword.press("Enter");
+      }
     } else {
-      await page.locator(emailSelector).first().press("Enter");
+      const continueButton = page
+        .locator("button, [role='button']")
+        .filter({ hasText: /^(continuar|continue|next|下一步)$/i })
+        .first();
+      if (await continueButton.isVisible({ timeout: 2_000 }).catch(() => false)) {
+        await continueButton.click({ timeout: 3_000 });
+      } else {
+        await page.locator(emailSelector).first().press("Enter");
+      }
     }
 
     // CAPTCHA remains automatic. Wait for it to settle before second auth.
@@ -3187,6 +3178,11 @@ async function loginViaUi(
     const passwordSelector = 'input[type="password"], input[name="password"]';
     try {
       await page.waitForSelector(passwordSelector, { timeout: 10_000 });
+      // Password fallback opens new form. Re-enter both credentials explicitly.
+      const secondEmail = page.locator(emailSelector).first();
+      if (await secondEmail.isVisible({ timeout: 2_000 }).catch(() => false)) {
+        await secondEmail.fill(email, { timeout: 5_000 });
+      }
       await page.fill(passwordSelector, password, { timeout: 8_000 });
       await sleep(500);
     } catch {
