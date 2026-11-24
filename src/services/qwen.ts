@@ -3451,6 +3451,11 @@ async function createQwenStreamInternal(
       if (captchaRecoveryAttempted || !accountId) return false;
       captchaRecoveryAttempted = true;
 
+      // Persisted headers/cookies are no longer trustworthy after WAF. Drop
+      // volatile cache before official challenge recovery; keep browser context.
+      const { invalidateAccountAuthCache } = await import("./playwright.ts");
+      invalidateAccountAuthCache(accountId);
+
       const solved = await recoverBaxiaCaptcha(accountId, label, {
         challengeBody,
       });

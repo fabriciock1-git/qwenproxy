@@ -545,6 +545,14 @@ const HEADER_REFRESH_THRESHOLD = 0.8; // Background refresh at 80% of TTL
 const COOKIE_CACHE_TTL = 60 * 1000; // 1 minute (prevents returning stale expiring token after refresh)
 const cookieCaches = new Map<string, { cookie: string; timestamp: number }>();
 const lastAccountActivity = new Map<string, number>();
+
+/** Invalidate volatile auth material after a completion WAF challenge. */
+export function invalidateAccountAuthCache(accountId: string): void {
+  headerCaches.delete(accountId);
+  cookieCaches.delete(accountId);
+  lastHeaderRestoreLog.delete(accountId);
+  console.warn(`[Playwright] Invalidated volatile auth cache after WAF | account=${accountId}`);
+}
 // Logging guard for repeated context warmups. Context recreation can be valid
 // after eviction/crash, but one restore per request floods logs and hides real
 // authentication failures.

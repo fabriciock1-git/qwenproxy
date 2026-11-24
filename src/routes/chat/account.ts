@@ -1877,6 +1877,15 @@ async function tryCreateStreamWithRetry(
 				continue;
 			}
 
+			if (policy.reason === "anti_bot") {
+				// WAF belongs to account/fingerprint. Never replay same account when
+				// pool has no clean candidate; surface failure to caller.
+				console.warn(
+					`🛑 [Chat] No other account available after anti_bot | failing without same-account retry`,
+				);
+				attemptsLeft = 0;
+				return { success: false, error: err };
+			}
 			console.warn(
 				`⚠️  [Chat] No other account available after ${policy.reason} | Retrying on same account`,
 			);
