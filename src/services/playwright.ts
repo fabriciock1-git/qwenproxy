@@ -678,6 +678,82 @@ async function waitForHumanAuthChallengeToClear(page: Page): Promise<void> {
   throw new Error("Qwen authentication page closed during human verification");
 }
 
+type AuthSurface =
+  | "SESSION_READY"
+  | "PRE_AUTH_WAF"
+  | "DURING_AUTH_WAF"
+  | "REPEATED_WAF"
+  | "EMAIL_ENTRY"
+  | "PASSWORD_ENTRY"
+  | "OTP_SCREEN"
+  | "AUTH_UNKNOWN";
+
+async function inspectAuthSurface(page: Page, seenWaf: number): Promise<AuthSurface> {
+  if (page.isClosed()) return "AUTH_UNKNOWN";
+  if (!page.url().includes("/auth") && (await isPageLoggedIn(page, 1500).catch(() => false))) {
+    return "SESSION_READY";
+  }
+  const text = await page
+    .evaluate(() => (document.body?.innerText || "").toLowerCase())
+    .catch(() => "");
+  const waf =
+    text.includes("access verification") ||
+    text.includes("drag to complete") ||
+    text.includes("security verification") ||
+    text.includes("verify you are human") ||
+    text.includes("verificação de acesso") ||
+    text.includes("arraste para completar");
+  if (waf) {
+    return seenWaf === 0 ? "PRE_AUTH_WAF" : seenWaf === 1 ? "DURING_AUTH_WAF" : "REPEATED_WAF";
+  }
+  const password = await page
+    .locator('input[type="password"], input[name="password"]')
+    .isVisible({ timeout: 300 })
+    .catch(() => false);
+  if (password) return "PASSWORD_ENTRY";
+  const otp = await page
+    .locator('[name*="code" i], [placeholder*="code" i], [aria-label*="verification" i]')
+    .isVisible({ timeout: 300 })
+    .catch(() => false);
+  if (otp || /verifique sua caixa|verification code|código de verificação|check your email/i.test(text)) {
+    return "OTP_SCREEN";
+  }
+  const email = await page
+    .locator('input[type="email"], input[name="email"], input[autocomplete="email"]')
+    .isVisible({ timeout: 300 })
+    .catch(() => false);
+  return email ? "EMAIL_ENTRY" : "AUTH_UNKNOWN";
+}
+
+async function driveAuthSurfaceToForm(page: Page): Promise<LoginAttemptResult | null> {
+  let wafCount = 0;
+  const deadline = Date.now() + 60_000;
+  while (!page.isClosed() && Date.now() < deadline) {
+    const surface = await inspectAuthSurface(page, wafCount);
+    if (surface === "SESSION_READY") return { success: true };
+    if (surface === "EMAIL_ENTRY" || surface === "PASSWORD_ENTRY" || surface === "OTP_SCREEN") {
+      return null;
+    }
+    if (surface === "PRE_AUTH_WAF" || surface === "DURING_AUTH_WAF" || surface === "REPEATED_WAF") {
+      wafCount += 1;
+      console.warn(`⚠️ [Playwright] Auth state=${surface}; running official CAPTCHA solver`);
+      if (config.captcha.enabled) {
+        await solveVisibleCaptcha(page, {
+          waitForMs: 500,
+          maxAttempts: config.captcha.maxAttempts,
+          retryDelayMs: config.captcha.retryDelayMs,
+          settleMs: config.captcha.settleMs,
+          sliderTimeoutMs: config.captcha.sliderTimeoutMs,
+        }).catch(() => false);
+      }
+      await sleep(750);
+      continue;
+    }
+    await sleep(500);
+  }
+  return { success: false, reason: "Authentication state did not reach login form or SESSION_READY" };
+}
+
 function getErrorMessage(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
@@ -3026,8 +3102,10 @@ async function loginViaUi(
       return { success: true };
     }
 
-    // CAPTCHA remains automatic after credentials are submitted.
-    // Do not run solver before email/password form is submitted.
+    // Dynamic pre-auth state handling. Page may show WAF, login, or ready UI.
+    const preAuthState = await driveAuthSurfaceToForm(page);
+    if (preAuthState?.success) return preAuthState;
+    if (preAuthState && !preAuthState.success) return preAuthState;
 
     // Wait for email input
     const emailSelector = [
@@ -3161,18 +3239,10 @@ async function loginViaUi(
       }
     }
 
-    // CAPTCHA remains automatic. Wait for it to settle before second auth.
-    if (config.captcha.enabled) {
-      await solveVisibleCaptcha(page, {
-        waitForMs: 1_000,
-        maxAttempts: config.captcha.maxAttempts,
-        retryDelayMs: config.captcha.retryDelayMs,
-        settleMs: config.captcha.settleMs,
-        sliderTimeoutMs: config.captcha.sliderTimeoutMs,
-      }).catch(() => false);
-    }
-
-    await sleep(1_000);
+    // Re-evaluate after credentials: CAPTCHA may repeat, reveal OTP, or finish.
+    const postCredentialsState = await driveAuthSurfaceToForm(page);
+    if (postCredentialsState?.success) return postCredentialsState;
+    if (postCredentialsState && !postCredentialsState.success) return postCredentialsState;
     await revealPasswordMode();
 
     const passwordSelector = 'input[type="password"], input[name="password"]';
